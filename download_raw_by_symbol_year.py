@@ -12,9 +12,10 @@ import pandas as pd
 import wrds
 
 
-BASE_DIR = Path("/project/macs30123")
+DEFAULT_BASE_DIR = Path.home() / "wrds_raw_downloads"
+BASE_DIR = Path(os.environ.get("WRDS_RAW_BASE_DIR", str(DEFAULT_BASE_DIR))).expanduser()
 
-DEFAULT_WRDS_MAX_WORKERS = max(1, int(os.environ.get("WRDS_MAX_WORKERS", "2")))
+DEFAULT_WRDS_MAX_WORKERS = 1
 WRDS_CONNECT_RETRIES = int(os.environ.get("WRDS_CONNECT_RETRIES", "6"))
 WRDS_CONNECT_RETRY_SECONDS = int(os.environ.get("WRDS_CONNECT_RETRY_SECONDS", "30"))
 FINAL_GZIP_COMPRESSLEVEL = int(os.environ.get("WRDS_FINAL_GZIP_COMPRESSLEVEL", "5"))
@@ -23,8 +24,131 @@ QUOTE_TABLE_PREFIXES = ("ctq_", "cqm_", "cq_")
 TRADE_TABLE_PREFIX = "ctm_"
 
 
+def _safe_rollback(conn):
+    try:
+        if getattr(conn, "connection", None) is not None:
+            conn.connection.rollback()
+    except Exception:
+        pass
+
+
+def get_wrds_backend_context(conn) -> dict:
+    sql = """
+    select
+        pg_backend_pid() as backend_pid,
+        current_user as current_user,
+        current_database() as current_database,
+        current_setting('application_name', true) as application_name
+    """
+    try:
+        df = conn.raw_sql(sql, chunksize=None)
+        if df.empty:
+            return {}
+        row = df.iloc[0].to_dict()
+        return {str(k): row.get(k) for k in row.keys()}
+    except Exception:
+        return {}
+
+
+def try_get_wrds_query_id(conn) -> str | None:
+    sql_candidates = [
+        "select query_id from pg_stat_activity where pid = pg_backend_pid()",
+        "select queryid as query_id from pg_stat_activity where pid = pg_backend_pid()",
+    ]
+    for sql in sql_candidates:
+        try:
+            df = conn.raw_sql(sql, chunksize=None)
+            if df.empty:
+                continue
+            value = df.iloc[0].get("query_id")
+            if pd.isna(value):
+                continue
+            return str(value)
+        except Exception:
+            continue
+    return None
+
+
+def format_wrds_exception(exc: Exception) -> str:
+    parts = [f"{type(exc).__name__}: {exc}"]
+    orig = getattr(exc, "orig", None)
+    if orig is not None:
+        parts.append(f"orig={type(orig).__name__}: {orig}")
+        pgcode = getattr(orig, "pgcode", None)
+        if pgcode:
+            parts.append(f"pgcode={pgcode}")
+        diag = getattr(orig, "diag", None)
+        if diag is not None:
+            for attr in (
+                "message_primary",
+                "message_detail",
+                "message_hint",
+                "statement_position",
+                "schema_name",
+                "table_name",
+                "column_name",
+                "datatype_name",
+                "constraint_name",
+            ):
+                value = getattr(diag, attr, None)
+                if value:
+                    parts.append(f"{attr}={value}")
+    return " | ".join(parts)
+
+
+def run_wrds_query(conn, sql: str, *, params=None, label: str, chunksize=500000):
+    ctx = get_wrds_backend_context(conn)
+    backend_pid = ctx.get("backend_pid")
+    print(
+        f"[WRDS QUERY START] label={label} | backend_pid={backend_pid} | params={params}",
+        flush=True,
+    )
+    try:
+        return conn.raw_sql(sql, params=params, chunksize=chunksize)
+    except Exception as exc:
+        err_text = format_wrds_exception(exc)
+        _safe_rollback(conn)
+        query_id = try_get_wrds_query_id(conn)
+        print(
+            f"[WRDS QUERY FAIL] label={label} | backend_pid={backend_pid} | "
+            f"query_id={query_id or 'unavailable'} | error={err_text}",
+            flush=True,
+        )
+        raise RuntimeError(
+            f"WRDS query failed | label={label} | backend_pid={backend_pid} | "
+            f"query_id={query_id or 'unavailable'} | error={err_text}"
+        ) from exc
+
+
+def list_wrds_tables(conn, library: str):
+    ctx = get_wrds_backend_context(conn)
+    backend_pid = ctx.get("backend_pid")
+    print(f"[WRDS LIST TABLES] library={library} | backend_pid={backend_pid}", flush=True)
+    try:
+        return conn.list_tables(library=library)
+    except Exception as exc:
+        err_text = format_wrds_exception(exc)
+        _safe_rollback(conn)
+        query_id = try_get_wrds_query_id(conn)
+        print(
+            f"[WRDS LIST TABLES FAIL] library={library} | backend_pid={backend_pid} | "
+            f"query_id={query_id or 'unavailable'} | error={err_text}",
+            flush=True,
+        )
+        raise RuntimeError(
+            f"WRDS list_tables failed | library={library} | backend_pid={backend_pid} | "
+            f"query_id={query_id or 'unavailable'} | error={err_text}"
+        ) from exc
+
+
 def ensure_base_dir(base_dir: Path) -> Path:
-    base_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        base_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as exc:
+        raise PermissionError(
+            f"Cannot create/write base directory: {base_dir}. "
+            f"Set WRDS_RAW_BASE_DIR to a writable path."
+        ) from exc
     return base_dir
 
 
@@ -109,7 +233,7 @@ def asset_year_dir(symbol: str, year: int) -> Path:
 
 
 def build_daily_table_index(conn):
-    tables = conn.list_tables(library="taqmsec")
+    tables = list_wrds_tables(conn, library="taqmsec")
     trade_tables = {}
     quote_tables = {}
 
@@ -181,12 +305,15 @@ def fetch_raw_trades_one_day(conn, table_name: str, symbol: str) -> pd.DataFrame
     order by date, time_m
     """
 
-    df = conn.raw_sql(
+    df = run_wrds_query(
+        conn,
         sql,
+        label=f"raw_trades:{table_name}:{symbol.upper()}",
         params={
             "sym_root": sym_root,
             "sym_suffix": sym_suffix,
         },
+        chunksize=None,
     )
 
     required_cols = {"date", "time_m", "sym_root", "sym_suffix", "price", "size"}
@@ -219,12 +346,15 @@ def fetch_raw_quotes_one_day(conn, table_name: str, symbol: str) -> pd.DataFrame
     order by date, time_m
     """
 
-    df = conn.raw_sql(
+    df = run_wrds_query(
+        conn,
         sql,
+        label=f"raw_quotes:{table_name}:{symbol.upper()}",
         params={
             "sym_root": sym_root,
             "sym_suffix": sym_suffix,
         },
+        chunksize=None,
     )
 
     required_cols = {"date", "time_m", "sym_root", "sym_suffix", "bid", "bidsiz", "ask", "asksiz"}
@@ -404,7 +534,7 @@ def run_one_symbol_year(symbol: str, year: int, table_index, username: str, pass
         save_one_year_raw(conn, table_index, symbol, year)
         return symbol, year, "ok", ""
     except Exception as exc:
-        return symbol, year, "error", repr(exc)
+        return symbol, year, "error", str(exc)
     finally:
         try:
             conn.close()
@@ -414,6 +544,7 @@ def run_one_symbol_year(symbol: str, year: int, table_index, username: str, pass
 
 def main():
     ensure_base_dir(BASE_DIR)
+    print(f"WRDS raw download base dir: {BASE_DIR}", flush=True)
 
     assets = [
         "AAPL",
@@ -443,33 +574,14 @@ def main():
             pass
 
     tasks = [(symbol, year) for symbol in assets for year in range(start_year, end_year + 1)]
-    max_workers = min(DEFAULT_WRDS_MAX_WORKERS, len(tasks))
+    max_workers = 1
 
-    print(f"Launching {len(tasks)} symbol-year tasks with {max_workers} worker process(es).", flush=True)
-
-    if max_workers == 1:
-        for symbol, year in tasks:
-            sym, yr, status, message = run_one_symbol_year(symbol, year, table_index, username, password)
-            if status == "ok":
-                print(f"[DONE] {sym} {yr}", flush=True)
-            else:
-                print(f"[FAIL] {sym} {yr} | {message}", flush=True)
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(run_one_symbol_year, symbol, year, table_index, username, password): (symbol, year)
-                for symbol, year in tasks
-            }
-            for future in as_completed(future_map):
-                symbol, year = future_map[future]
-                try:
-                    sym, yr, status, message = future.result()
-                    if status == "ok":
-                        print(f"[DONE] {sym} {yr}", flush=True)
-                    else:
-                        print(f"[FAIL] {sym} {yr} | {message}", flush=True)
-                except Exception as exc:
-                    print(f"[FAIL] {symbol} {year} | {repr(exc)}", flush=True)
+    for symbol, year in tasks:
+        sym, yr, status, message = run_one_symbol_year(symbol, year, table_index, username, password)
+        if status == "ok":
+            print(f"[DONE] {sym} {yr}", flush=True)
+        else:
+            print(f"[FAIL] {sym} {yr} | {message}", flush=True)
 
     print("All tasks finished.", flush=True)
 
